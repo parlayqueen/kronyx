@@ -1,0 +1,27 @@
+{
+  "ok": true,
+  "delegation_token": "krxdt.eyJjYXBhYmlsaXRpZXMiOlsiZmlsZS5yZWFkIl0sImRlbGVnYXRlZV9hZ2VudF9pZCI6ImFnZW50X3JlYWRvbmx5IiwiZGVsZWdhdG9yX2FnZW50X2lkIjoiYWdlbnRfNDIiLCJleHAiOjE3NzI4MjA0NDksImZpbGVfcG9saWN5Ijp7ImFsbG93ZWRfcm9vdHMiOlsifi9rcm9ueXhfbXZwIl0sIm1heF9ieXRlcyI6NTAwMDB9LCJpYXQiOjE3NzI4MTk4NDksImlzcyI6Iktyb255eCIsImp0aSI6ImtyeGp0aV9mNjliOGVmNzBmNDc0ODdiODE1OGRmNTZiMzAxY2ZlNiIsIm1ldGFkYXRhIjp7InB1cnBvc2UiOiJuYXJyb3cgY2FwYWJpbGl0eSB0ZXN0In0sInR5cCI6ImRlbGVnYXRpb24ifQ.YWYxMTJjNmU2YWNjNmE5ZjQyMWEzMTM3YTk1MmJjZjlkZGQ2YWQ5YmU3Y2VkN2MxMjQyNGYwYjhmNmUyMDFhOA",
+  "delegation_payload": {
+    "iss": "Kronyx",
+    "typ": "delegation",
+    "jti": "krxjti_f69b8ef70f47487b8158df56b301cfe6",
+    "delegator_agent_id": "agent_42",
+    "delegatee_agent_id": "agent_readonly",
+    "capabilities": [
+      "file.read"
+    ],
+    "exp": 1772820449,
+    "iat": 1772819849,
+    "file_policy": {
+      "allowed_roots": [
+        "~/kronyx_mvp"
+      ],
+      "max_bytes": 50000
+    },
+    "metadata": {
+      "purpose": "narrow capability test"
+    }
+  },
+  "receipt_id": "krxdel_79578dddfff8465bbb",
+  "signature": "6f41a85071c3a27e5476271743d5b7b44b73e0009a023500ccfc2e26e002878b"
+}

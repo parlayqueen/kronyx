@@ -1,629 +1,855 @@
 #!/usr/bin/env python3
-"""
-KRONYX MVP Runtime (Atlas) — execution-time governance for autonomous actions.
-
-- Standard library only (Termux friendly)
-- SQLite storage for:
-  - capabilities registry
-  - budgets
-  - policies
-  - idempotency keys
-  - append-only execution ledger
-- HMAC-signed capability tokens
-- Governed "actions":
-  - http_request (GET/POST) with allowlist
-  - noop (for testing)
-  - simulate_payment (NO real payments; just demonstrates governance)
-
-Run:
-  python kronyx_runtime.py --host 127.0.0.1 --port 8787
-
-Then use:
-  python tools_admin.py init
-  python tools_admin.py issue-token --agent agent_42 --cap http_request --cap noop
-  python agent_demo.py
-"""
-
-import argparse
-import base64
-import datetime as dt
-import hashlib
-import hmac
-import json
 import os
-import sqlite3
-import threading
+import json
 import time
-import urllib.request
-import urllib.parse
+import uuid
+import hmac
+import hashlib
+from pathlib import Path
+from typing import Dict, Any, Optional
+from urllib.parse import urlparse, parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional, Tuple
 
+from action_executor import ActionExecutor, ExecutionError
+from delegation import DelegationManager, DelegationError
+from kronyx_store import KronyxStore
 
-DB_FILE_DEFAULT = os.environ.get("KRONYX_DB", "kronyx.db")
-HMAC_SECRET_DEFAULT = os.environ.get("KRONYX_HMAC_SECRET", "CHANGE_ME__set_KRONYX_HMAC_SECRET")
-LEDGER_MAX_BODY = 4096  # store small payload excerpts
-UTC = dt.timezone.utc
+APP_TITLE = "Kronyx Runtime Kernel"
+APP_VERSION = "0.6.0-stdlib-sqlite-revoke-hardened"
 
+DATA_DIR = Path(os.environ.get("KRONYX_DATA_DIR", "./data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-def utc_now_iso() -> str:
-    return dt.datetime.now(tz=UTC).isoformat()
+POLICY_FILE = Path(os.environ.get("KRONYX_POLICY_FILE", DATA_DIR / "policy.json"))
+RECEIPT_FILE = Path(os.environ.get("KRONYX_RECEIPT_FILE", DATA_DIR / "receipts.jsonl"))
 
+KRONYX_MASTER_TOKEN = os.environ.get("KRONYX_MASTER_TOKEN", "change-me-now")
+KRONYX_SIGNING_KEY = os.environ.get("KRONYX_SIGNING_KEY", "replace-with-long-random-key")
+KRONYX_DELEGATION_KEY = os.environ.get("KRONYX_DELEGATION_KEY", KRONYX_SIGNING_KEY)
+KRONYX_DB_PATH = os.environ.get("KRONYX_DB_PATH", str(DATA_DIR / "kronyx.db"))
+HOST = os.environ.get("KRONYX_HOST", "0.0.0.0")
+PORT = int(os.environ.get("KRONYX_PORT", "8787"))
 
-def day_key_utc() -> str:
-    d = dt.datetime.now(tz=UTC).date()
-    return d.isoformat()
-
-
-def b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
-
-
-def b64url_decode(s: str) -> bytes:
-    pad = "=" * ((4 - (len(s) % 4)) % 4)
-    return base64.urlsafe_b64decode((s + pad).encode("utf-8"))
-
-
-def hmac_sign(secret: str, msg: bytes) -> str:
-    sig = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).digest()
-    return b64url(sig)
-
-
-def canonical_json(obj: Any) -> bytes:
-    # Deterministic serialization (lightweight). For strict canonicalization later, use RFC 8785 JCS.
-    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
-
-
-class DB:
-    def __init__(self, path: str):
-        self.path = path
-        self._lock = threading.Lock()
-        self._ensure()
-
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _ensure(self) -> None:
-        with self._lock:
-            conn = self._conn()
-            try:
-                conn.executescript(
-                    """
-                    CREATE TABLE IF NOT EXISTS agents (
-                        agent_id TEXT PRIMARY KEY,
-                        display_name TEXT,
-                        created_at TEXT NOT NULL
-                    );
-
-                    CREATE TABLE IF NOT EXISTS agent_caps (
-                        agent_id TEXT NOT NULL,
-                        capability TEXT NOT NULL,
-                        created_at TEXT NOT NULL,
-                        PRIMARY KEY (agent_id, capability),
-                        FOREIGN KEY (agent_id) REFERENCES agents(agent_id)
-                    );
-
-                    CREATE TABLE IF NOT EXISTS budgets (
-                        agent_id TEXT NOT NULL,
-                        day TEXT NOT NULL,
-                        action TEXT NOT NULL,
-                        max_count INTEGER NOT NULL,
-                        used_count INTEGER NOT NULL,
-                        max_amount_cents INTEGER,  -- optional (for payment-like actions)
-                        used_amount_cents INTEGER NOT NULL,
-                        updated_at TEXT NOT NULL,
-                        PRIMARY KEY (agent_id, day, action),
-                        FOREIGN KEY (agent_id) REFERENCES agents(agent_id)
-                    );
-
-                    CREATE TABLE IF NOT EXISTS policies (
-                        policy_id TEXT PRIMARY KEY,
-                        action TEXT NOT NULL,
-                        mode TEXT NOT NULL, -- 'allow' or 'deny'
-                        rules_json TEXT NOT NULL,
-                        created_at TEXT NOT NULL
-                    );
-
-                    CREATE TABLE IF NOT EXISTS idempotency (
-                        agent_id TEXT NOT NULL,
-                        idem_key TEXT NOT NULL,
-                        action TEXT NOT NULL,
-                        status TEXT NOT NULL, -- 'approved'|'rejected'|'executed'|'failed'
-                        response_json TEXT,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL,
-                        PRIMARY KEY (agent_id, idem_key, action)
-                    );
-
-                    CREATE TABLE IF NOT EXISTS ledger (
-                        ledger_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        ts TEXT NOT NULL,
-                        agent_id TEXT NOT NULL,
-                        action TEXT NOT NULL,
-                        outcome TEXT NOT NULL, -- approved|rejected|executed|failed
-                        reason TEXT,
-                        request_excerpt TEXT,
-                        response_excerpt TEXT,
-                        cap_token_hash TEXT,
-                        policy_snapshot TEXT,
-                        budget_snapshot TEXT,
-                        idem_key TEXT,
-                        prev_hash TEXT,
-                        entry_hash TEXT NOT NULL
-                    );
-
-                    CREATE INDEX IF NOT EXISTS idx_ledger_agent_ts ON ledger(agent_id, ts);
-                    """
-                )
-            finally:
-                conn.close()
-
-    def execute(self, sql: str, params: Tuple[Any, ...] = ()) -> None:
-        conn = self._conn()
-        try:
-            conn.execute(sql, params)
-        finally:
-            conn.close()
-
-    def fetchone(self, sql: str, params: Tuple[Any, ...] = ()) -> Optional[sqlite3.Row]:
-        conn = self._conn()
-        try:
-            cur = conn.execute(sql, params)
-            return cur.fetchone()
-        finally:
-            conn.close()
-
-    def fetchall(self, sql: str, params: Tuple[Any, ...] = ()) -> list:
-        conn = self._conn()
-        try:
-            cur = conn.execute(sql, params)
-            return cur.fetchall()
-        finally:
-            conn.close()
-
-    def transaction(self):
-        # context manager for transaction
-        conn = self._conn()
-        conn.execute("BEGIN IMMEDIATE;")
-        return conn
-
-
-class GovernanceError(Exception):
-    def __init__(self, code: str, message: str, details: Optional[Dict[str, Any]] = None):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.details = details or {}
-
-
-class KronyxRuntime:
-    def __init__(self, db: DB, secret: str):
-        self.db = db
-        self.secret = secret
-        self.allowed_http_hosts = set(
-            (os.environ.get("KRONYX_HTTP_ALLOWLIST", "httpbin.org,postman-echo.com").split(","))
-        )
-
-    # -------- Token format --------
-    # token = base64url(payload_json) + "." + base64url(hmac_sha256(payload_json))
-    # payload: {agent_id, caps:[...], iat, exp}
-    def verify_token(self, token: str) -> Dict[str, Any]:
-        try:
-            payload_b64, sig_b64 = token.split(".", 1)
-            payload_bytes = b64url_decode(payload_b64)
-            payload = json.loads(payload_bytes.decode("utf-8"))
-            expected = hmac_sign(self.secret, payload_bytes)
-            if not hmac.compare_digest(expected, sig_b64):
-                raise GovernanceError("bad_token", "Token signature invalid")
-            now = int(time.time())
-            if int(payload.get("iat", 0)) > now + 60:
-                raise GovernanceError("bad_token", "Token iat is in the future")
-            if int(payload.get("exp", 0)) < now:
-                raise GovernanceError("expired_token", "Token is expired")
-            return payload
-        except ValueError:
-            raise GovernanceError("bad_token", "Token format invalid")
-        except json.JSONDecodeError:
-            raise GovernanceError("bad_token", "Token payload invalid JSON")
-
-    def token_hash(self, token: str) -> str:
-        return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-    # -------- Core checks --------
-    def require_capability(self, agent_id: str, cap: str) -> None:
-        row = self.db.fetchone(
-            "SELECT 1 FROM agent_caps WHERE agent_id=? AND capability=?",
-            (agent_id, cap),
-        )
-        if not row:
-            raise GovernanceError("cap_denied", f"Agent '{agent_id}' lacks capability '{cap}'")
-
-    def eval_policies(self, action: str, request_obj: Dict[str, Any]) -> Dict[str, Any]:
-        # Policies are simple JSON rules. MVP supports:
-        # - allow/deny by matching keys in request_obj with exact values
-        # rules_json: {"match": {"field":"value", ...}}
-        policies = self.db.fetchall(
-            "SELECT policy_id, mode, rules_json FROM policies WHERE action=?",
-            (action,),
-        )
-        snapshot = {"evaluated": [], "decision": "allow"}  # default allow if no deny matches
-        for p in policies:
-            rules = json.loads(p["rules_json"])
-            match = rules.get("match", {})
-            ok = True
-            for k, v in match.items():
-                if request_obj.get(k) != v:
-                    ok = False
-                    break
-            snapshot["evaluated"].append({"policy_id": p["policy_id"], "mode": p["mode"], "matched": ok})
-            if ok and p["mode"] == "deny":
-                snapshot["decision"] = "deny"
-                snapshot["deny_policy_id"] = p["policy_id"]
-                return snapshot
-        return snapshot
-
-    def enforce_budget(self, agent_id: str, action: str, amount_cents: int = 0) -> Dict[str, Any]:
-        dkey = day_key_utc()
-        # If no budget row exists, create a permissive default for MVP.
-        # In production you’d be explicit. Here defaults prevent runaway:
-        # - max_count: 1000/day per action
-        # - max_amount_cents: 0 means not tracked unless set
-        with self.db.transaction() as conn:
-            row = conn.execute(
-                "SELECT * FROM budgets WHERE agent_id=? AND day=? AND action=?",
-                (agent_id, dkey, action),
-            ).fetchone()
-            if row is None:
-                conn.execute(
-                    "INSERT INTO budgets(agent_id, day, action, max_count, used_count, max_amount_cents, used_amount_cents, updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?)",
-                    (agent_id, dkey, action, 1000, 0, None, 0, utc_now_iso()),
-                )
-                row = conn.execute(
-                    "SELECT * FROM budgets WHERE agent_id=? AND day=? AND action=?",
-                    (agent_id, dkey, action),
-                ).fetchone()
-
-            max_count = int(row["max_count"])
-            used_count = int(row["used_count"])
-            max_amount = row["max_amount_cents"]
-            used_amount = int(row["used_amount_cents"])
-
-            if used_count + 1 > max_count:
-                raise GovernanceError("budget_exhausted", f"Budget exceeded for action '{action}' (count)")
-
-            if max_amount is not None and amount_cents > 0:
-                if used_amount + amount_cents > int(max_amount):
-                    raise GovernanceError("budget_exhausted", f"Budget exceeded for action '{action}' (amount)")
-
-            # commit consumption
-            new_used_count = used_count + 1
-            new_used_amount = used_amount + max(0, amount_cents)
-            conn.execute(
-                "UPDATE budgets SET used_count=?, used_amount_cents=?, updated_at=? "
-                "WHERE agent_id=? AND day=? AND action=?",
-                (new_used_count, new_used_amount, utc_now_iso(), agent_id, dkey, action),
-            )
-
-            return {
-                "day": dkey,
-                "action": action,
-                "max_count": max_count,
-                "used_count": new_used_count,
-                "max_amount_cents": max_amount,
-                "used_amount_cents": new_used_amount,
+DEFAULT_POLICY = {
+    "agents": {
+        "agent_42": {
+            "token": "agent-secret-42",
+            "capabilities": [
+                "http.fetch",
+                "file.read",
+                "math.compute",
+                "delegate.issue",
+                "delegate.revoke"
+            ],
+            "delegation_policy": {
+                "max_ttl_seconds": 3600,
+                "allowed_delegate_capabilities": [
+                    "http.fetch",
+                    "file.read",
+                    "math.compute"
+                ]
+            },
+            "limits": {
+                "max_requests_per_hour": 100,
+                "max_spend_usd_per_day": 1.0,
+                "max_file_reads_per_hour": 50,
+                "max_http_requests_per_hour": 25
+            },
+            "http_policy": {
+                "allowed_domains": [
+                    "example.com",
+                    "httpbin.org"
+                ],
+                "blocked_domains": [],
+                "allowed_methods": [
+                    "GET"
+                ],
+                "timeout_seconds": 15,
+                "max_response_bytes": 250000
+            },
+            "file_policy": {
+                "allowed_roots": [
+                    "~/kronyx_mvp",
+                    "~/storage/shared/Download"
+                ],
+                "max_bytes": 200000
             }
+        },
+        "agent_readonly": {
+            "token": "readonly-007",
+            "capabilities": [
+                "file.read"
+            ],
+            "limits": {
+                "max_requests_per_hour": 20,
+                "max_spend_usd_per_day": 0.0,
+                "max_file_reads_per_hour": 20,
+                "max_http_requests_per_hour": 0
+            },
+            "file_policy": {
+                "allowed_roots": [
+                    "~/kronyx_mvp"
+                ],
+                "max_bytes": 120000
+            }
+        }
+    }
+}
 
-    def idempotency_check(self, agent_id: str, action: str, idem_key: str) -> Optional[Dict[str, Any]]:
-        if not idem_key:
-            return None
-        row = self.db.fetchone(
-            "SELECT status, response_json FROM idempotency WHERE agent_id=? AND action=? AND idem_key=?",
-            (agent_id, action, idem_key),
-        )
-        if row:
-            resp = json.loads(row["response_json"]) if row["response_json"] else None
-            return {"status": row["status"], "response": resp}
-        return None
 
-    def idempotency_set(self, agent_id: str, action: str, idem_key: str, status: str, response: Optional[Dict[str, Any]]) -> None:
-        if not idem_key:
-            return
-        now = utc_now_iso()
-        resp_json = json.dumps(response) if response is not None else None
-        self.db.execute(
-            "INSERT INTO idempotency(agent_id, idem_key, action, status, response_json, created_at, updated_at) "
-            "VALUES(?,?,?,?,?,?,?) "
-            "ON CONFLICT(agent_id, idem_key, action) DO UPDATE SET status=excluded.status, response_json=excluded.response_json, updated_at=excluded.updated_at",
-            (agent_id, idem_key, action, status, resp_json, now, now),
-        )
+def now_ts() -> int:
+    return int(time.time())
 
-    # -------- Ledger --------
-    def ledger_append(
+
+def iso_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def stable_json(data: Dict[str, Any]) -> str:
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def ensure_policy_file() -> None:
+    if not POLICY_FILE.exists():
+        POLICY_FILE.write_text(json.dumps(DEFAULT_POLICY, indent=2), encoding="utf-8")
+
+
+def load_policy() -> Dict[str, Any]:
+    ensure_policy_file()
+    return json.loads(POLICY_FILE.read_text(encoding="utf-8"))
+
+
+def sign_receipt(receipt: Dict[str, Any]) -> str:
+    payload = stable_json(receipt).encode("utf-8")
+    return hmac.new(
+        KRONYX_SIGNING_KEY.encode("utf-8"),
+        payload,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def append_receipt_jsonl(receipt: Dict[str, Any]) -> None:
+    with RECEIPT_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(receipt, sort_keys=True, ensure_ascii=False) + "\n")
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def deep_copy_dict(value: Dict[str, Any]) -> Dict[str, Any]:
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+class PolicyEngine:
+    def __init__(self, store: KronyxStore) -> None:
+        self.policy = load_policy()
+        self.store = store
+
+    def reload(self) -> None:
+        self.policy = load_policy()
+
+    def get_policy(self) -> Dict[str, Any]:
+        return self.policy
+
+    def get_agent(self, agent_id: str) -> Dict[str, Any]:
+        agents = self.policy.get("agents", {})
+        agent = agents.get(agent_id)
+        if not isinstance(agent, dict):
+            raise ValueError(f"Unknown agent_id: {agent_id}")
+        return agent
+
+    def verify_static_token(self, agent_id: str, presented_token: Optional[str]) -> None:
+        agent = self.get_agent(agent_id)
+        expected = str(agent.get("token", ""))
+        if not presented_token or presented_token != expected:
+            raise PermissionError("Invalid agent token")
+
+    def _build_receipt(
         self,
-        agent_id: str,
-        action: str,
-        outcome: str,
+        receipt_id: str,
+        req: Dict[str, Any],
+        allowed: bool,
         reason: str,
-        request_obj: Dict[str, Any],
-        response_obj: Optional[Dict[str, Any]],
-        cap_token: str,
-        policy_snapshot: Dict[str, Any],
-        budget_snapshot: Optional[Dict[str, Any]],
-        idem_key: Optional[str],
-    ) -> str:
-        req_excerpt = json.dumps(request_obj)[:LEDGER_MAX_BODY]
-        resp_excerpt = json.dumps(response_obj)[:LEDGER_MAX_BODY] if response_obj is not None else None
-        cap_hash = self.token_hash(cap_token)
-
-        prev = self.db.fetchone("SELECT entry_hash FROM ledger ORDER BY ledger_id DESC LIMIT 1")
-        prev_hash = prev["entry_hash"] if prev else None
-
-        entry = {
-            "ts": utc_now_iso(),
-            "agent_id": agent_id,
-            "action": action,
-            "outcome": outcome,
+        usage: Dict[str, Any],
+        execution: Optional[Dict[str, Any]] = None,
+        auth_context: Optional[Dict[str, Any]] = None,
+        event_type: str = "execution",
+    ) -> Dict[str, Any]:
+        receipt = {
+            "receipt_id": receipt_id,
+            "timestamp": iso_now(),
+            "timestamp_epoch": now_ts(),
+            "event_type": event_type,
+            "agent_id": req.get("agent_id"),
+            "action": req.get("action"),
+            "resource": req.get("resource"),
+            "metadata": req.get("metadata", {}),
+            "estimated_cost_usd": safe_float(req.get("estimated_cost_usd", 0.0), 0.0),
+            "allowed": allowed,
             "reason": reason,
-            "request_excerpt": req_excerpt,
-            "response_excerpt": resp_excerpt or "",
-            "cap_token_hash": cap_hash,
-            "policy_snapshot": policy_snapshot,
-            "budget_snapshot": budget_snapshot,
-            "idem_key": idem_key or "",
-            "prev_hash": prev_hash or "",
+            "usage_snapshot": usage,
         }
-        entry_hash = hashlib.sha256(canonical_json(entry)).hexdigest()
+        if execution is not None:
+            receipt["execution"] = execution
+        if auth_context is not None:
+            receipt["auth_context"] = auth_context
+        return receipt
 
-        self.db.execute(
-            "INSERT INTO ledger(ts, agent_id, action, outcome, reason, request_excerpt, response_excerpt, cap_token_hash, policy_snapshot, budget_snapshot, idem_key, prev_hash, entry_hash) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                entry["ts"],
-                agent_id,
-                action,
-                outcome,
-                reason,
-                req_excerpt,
-                resp_excerpt,
-                cap_hash,
-                json.dumps(policy_snapshot),
-                json.dumps(budget_snapshot) if budget_snapshot is not None else None,
-                idem_key,
-                prev_hash,
-                entry_hash,
-            ),
-        )
-        return entry_hash
+    def authorize(
+        self,
+        req: Dict[str, Any],
+        auth_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        agent_id = str(req.get("agent_id", "")).strip()
+        action = str(req.get("action", "")).strip()
 
-    # -------- Action handlers --------
-    def _handle_noop(self, req: Dict[str, Any]) -> Dict[str, Any]:
-        return {"ok": True, "echo": req.get("payload", {}), "ts": utc_now_iso()}
+        if not agent_id:
+            raise ValueError("Missing agent_id")
+        if not action:
+            raise ValueError("Missing action")
 
-    def _handle_simulate_payment(self, req: Dict[str, Any]) -> Dict[str, Any]:
-        # This is a simulation only. It proves idempotency + budgets + ledger.
-        payload = req.get("payload", {})
-        amount_cents = int(payload.get("amount_cents", 0))
-        recipient = str(payload.get("recipient", "unknown"))
-        if amount_cents <= 0:
-            raise GovernanceError("bad_request", "amount_cents must be > 0")
-        # Return a deterministic fake receipt id
-        receipt_id = hashlib.sha256(f"{recipient}:{amount_cents}:{req.get('idem_key','')}".encode("utf-8")).hexdigest()[:16]
-        return {"ok": True, "simulated": True, "receipt_id": receipt_id, "amount_cents": amount_cents, "recipient": recipient}
+        usage = self.store.usage_for_agent(agent_id)
+        receipt_id = f"krx_{uuid.uuid4().hex[:18]}"
 
-    def _handle_http_request(self, req: Dict[str, Any]) -> Dict[str, Any]:
-        payload = req.get("payload", {})
-        method = str(payload.get("method", "GET")).upper()
-        url = str(payload.get("url", ""))
-        data = payload.get("data", None)
-        headers = payload.get("headers", {})
+        if auth_context and auth_context.get("auth_type") == "delegation":
+            allowed = set(auth_context.get("capabilities", []))
+        else:
+            agent = self.get_agent(agent_id)
+            allowed = set(agent.get("capabilities", []))
 
-        if not url.startswith("http://") and not url.startswith("https://"):
-            raise GovernanceError("bad_request", "url must start with http:// or https://")
-
-        parsed = urllib.parse.urlparse(url)
-        host = parsed.hostname or ""
-        if host not in self.allowed_http_hosts:
-            raise GovernanceError("policy_denied", f"host '{host}' not in allowlist")
-
-        if method not in ("GET", "POST"):
-            raise GovernanceError("policy_denied", "Only GET/POST allowed in MVP")
-
-        body_bytes = None
-        if data is not None:
-            if isinstance(data, (dict, list)):
-                body_bytes = json.dumps(data).encode("utf-8")
-                headers = dict(headers)
-                headers.setdefault("Content-Type", "application/json")
-            elif isinstance(data, str):
-                body_bytes = data.encode("utf-8")
-            else:
-                raise GovernanceError("bad_request", "data must be dict/list/str")
-
-        req_obj = urllib.request.Request(url=url, method=method, data=body_bytes)
-        for k, v in (headers or {}).items():
-            req_obj.add_header(str(k), str(v))
-
-        try:
-            with urllib.request.urlopen(req_obj, timeout=10) as resp:
-                raw = resp.read()
-                ct = resp.headers.get("Content-Type", "")
-                text = raw[:8192].decode("utf-8", errors="replace")
-                return {
-                    "ok": True,
-                    "status": int(resp.status),
-                    "content_type": ct,
-                    "body_preview": text,
-                }
-        except Exception as e:
-            raise GovernanceError("external_error", f"http_request failed: {e.__class__.__name__}: {e}")
-
-    def execute(self, agent_id: str, token: str, action: str, capability: str, idem_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        # 1) token verify
-        tok = self.verify_token(token)
-        if tok.get("agent_id") != agent_id:
-            raise GovernanceError("bad_token", "Token agent_id mismatch")
-
-        # 2) capability must be in signed token AND in registry (two-man rule)
-        caps = set(tok.get("caps", []))
-        if capability not in caps:
-            raise GovernanceError("cap_denied", f"Capability '{capability}' not present in token")
-        self.require_capability(agent_id, capability)
-
-        # 3) idempotency
-        hit = self.idempotency_check(agent_id, action, idem_key)
-        if hit:
-            # return previously computed response, do not repeat side effect
+        if action not in allowed:
             return {
-                "ok": True,
-                "idempotent_replay": True,
-                "previous_status": hit["status"],
-                "previous_response": hit["response"],
+                "ok": False,
+                "reason": f"Action not allowed: {action}",
+                "receipt_id": receipt_id,
+                "usage": usage,
+                "granted_capability": None,
             }
 
-        # 4) policy evaluation (MVP: allow/deny match rules)
-        request_obj = {
-            "agent_id": agent_id,
-            "action": action,
-            "capability": capability,
-            "idem_key": idem_key,
-            "payload": payload or {},
+        agent = self.get_agent(agent_id)
+        limits = agent.get("limits", {})
+
+        if usage["requests_this_hour"] >= safe_int(limits.get("max_requests_per_hour", 10**9), 10**9):
+            return {
+                "ok": False,
+                "reason": "Hourly request budget exceeded",
+                "receipt_id": receipt_id,
+                "usage": usage,
+                "granted_capability": action,
+            }
+
+        if action == "http.fetch":
+            if usage["http_requests_this_hour"] >= safe_int(limits.get("max_http_requests_per_hour", 10**9), 10**9):
+                return {
+                    "ok": False,
+                    "reason": "Hourly HTTP request budget exceeded",
+                    "receipt_id": receipt_id,
+                    "usage": usage,
+                    "granted_capability": action,
+                }
+
+        if action == "file.read":
+            if usage["file_reads_this_hour"] >= safe_int(limits.get("max_file_reads_per_hour", 10**9), 10**9):
+                return {
+                    "ok": False,
+                    "reason": "Hourly file-read budget exceeded",
+                    "receipt_id": receipt_id,
+                    "usage": usage,
+                    "granted_capability": action,
+                }
+
+        projected_spend = round(
+            usage["spend_today_usd"] + safe_float(req.get("estimated_cost_usd", 0.0), 0.0),
+            6
+        )
+        if projected_spend > safe_float(limits.get("max_spend_usd_per_day", 10**9), 10**9):
+            return {
+                "ok": False,
+                "reason": f"Daily spend budget exceeded: projected={projected_spend}",
+                "receipt_id": receipt_id,
+                "usage": usage,
+                "granted_capability": action,
+            }
+
+        new_usage = dict(usage)
+        new_usage["requests_this_hour"] += 1
+        if action == "http.fetch":
+            new_usage["http_requests_this_hour"] += 1
+        if action == "file.read":
+            new_usage["file_reads_this_hour"] += 1
+        new_usage["spend_today_usd"] = projected_spend
+
+        return {
+            "ok": True,
+            "reason": "Approved",
+            "receipt_id": receipt_id,
+            "usage": new_usage,
+            "granted_capability": action,
         }
-        pol = self.eval_policies(action, request_obj)
-        if pol.get("decision") == "deny":
-            reason = f"Denied by policy {pol.get('deny_policy_id','unknown')}"
-            self.idempotency_set(agent_id, action, idem_key, "rejected", {"error": "policy_denied", "reason": reason})
-            self.ledger_append(agent_id, action, "rejected", reason, request_obj, {"error": "policy_denied"}, token, pol, None, idem_key)
-            raise GovernanceError("policy_denied", reason)
 
-        # 5) budget enforcement (action-specific amount optional)
-        amount_cents = 0
-        if action == "simulate_payment":
-            amount_cents = int((payload or {}).get("amount_cents", 0))
-        budget = self.enforce_budget(agent_id, action, amount_cents=amount_cents)
+    def finalize(
+        self,
+        req: Dict[str, Any],
+        decision: Dict[str, Any],
+        execution: Optional[Dict[str, Any]] = None,
+        auth_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        allowed = bool(decision.get("ok"))
+        reason = str(decision.get("reason", ""))
+        receipt_id = str(decision.get("receipt_id", ""))
+        usage = decision.get("usage", {})
+        if not isinstance(usage, dict):
+            usage = {}
 
-        # 6) approve & execute action
-        self.idempotency_set(agent_id, action, idem_key, "approved", {"approved": True})
-        self.ledger_append(agent_id, action, "approved", "approved", request_obj, {"approved": True}, token, pol, budget, idem_key)
+        receipt = self._build_receipt(
+            receipt_id=receipt_id,
+            req=req,
+            allowed=allowed,
+            reason=reason,
+            usage=usage,
+            execution=execution,
+            auth_context=auth_context,
+            event_type="execution",
+        )
+        sig = sign_receipt(receipt)
+        receipt["signature"] = sig
 
-        try:
-            if action == "noop":
-                resp = self._handle_noop(request_obj)
-            elif action == "http_request":
-                resp = self._handle_http_request(request_obj)
-            elif action == "simulate_payment":
-                resp = self._handle_simulate_payment(request_obj)
-            else:
-                raise GovernanceError("unknown_action", f"Unknown action '{action}'")
+        append_receipt_jsonl(receipt)
+        self.store.insert_receipt(receipt)
 
-            self.idempotency_set(agent_id, action, idem_key, "executed", resp)
-            self.ledger_append(agent_id, action, "executed", "executed", request_obj, resp, token, pol, budget, idem_key)
-            return resp
-        except GovernanceError as ge:
-            self.idempotency_set(agent_id, action, idem_key, "failed", {"error": ge.code, "message": ge.message, "details": ge.details})
-            self.ledger_append(agent_id, action, "failed", f"{ge.code}: {ge.message}", request_obj, {"error": ge.code, "message": ge.message}, token, pol, budget, idem_key)
-            raise
-        except Exception as e:
-            msg = f"{e.__class__.__name__}: {e}"
-            self.idempotency_set(agent_id, action, idem_key, "failed", {"error": "internal_error", "message": msg})
-            self.ledger_append(agent_id, action, "failed", msg, request_obj, {"error": "internal_error", "message": msg}, token, pol, budget, idem_key)
-            raise GovernanceError("internal_error", msg)
+        return {
+            "ok": allowed,
+            "reason": reason,
+            "receipt_id": receipt_id,
+            "signature": sig,
+            "usage": usage,
+            "granted_capability": decision.get("granted_capability"),
+            "execution": execution,
+            "auth_context": auth_context,
+        }
 
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "KRONYX/0.1"
+store = KronyxStore(KRONYX_DB_PATH)
+engine = PolicyEngine(store)
+delegation_manager = DelegationManager(KRONYX_DELEGATION_KEY)
+executor = ActionExecutor(engine.get_policy())
 
-    def _json(self, code: int, obj: Dict[str, Any]) -> None:
-        body = json.dumps(obj).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
+
+class KronyxHandler(BaseHTTPRequestHandler):
+    server_version = "KronyxHTTP/0.6"
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        timestamp = iso_now()
+        message = fmt % args
+        print(f"[{timestamp}] {self.address_string()} {message}", flush=True)
+
+    def _send_json(self, status: int, payload: Dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_json(self) -> Dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        raw = self.rfile.read(length) if length > 0 else b"{}"
+    def _read_json_body(self) -> Dict[str, Any]:
+        content_length = safe_int(self.headers.get("Content-Length", "0"), 0)
+        if content_length <= 0:
+            raise ValueError("Missing request body")
+        raw = self.rfile.read(content_length)
         try:
-            return json.loads(raw.decode("utf-8"))
-        except Exception:
-            raise GovernanceError("bad_request", "Invalid JSON body")
+            data = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            raise ValueError(f"Invalid JSON body: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object")
+        return data
 
-    def do_GET(self):
-        # simple health + ledger tail
-        if self.path == "/health":
-            return self._json(200, {"ok": True, "ts": utc_now_iso()})
-        if self.path.startswith("/ledger/tail"):
+    def _get_bearer_token(self) -> Optional[str]:
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return None
+        return auth.split(" ", 1)[1].strip()
+
+    def _require_master_token(self) -> None:
+        token = self._get_bearer_token()
+        if token != KRONYX_MASTER_TOKEN:
+            raise PermissionError("Forbidden")
+
+    def _is_master_token(self, token: Optional[str]) -> bool:
+        return bool(token) and token == KRONYX_MASTER_TOKEN
+
+    def _build_executor_for_auth(self, auth_context: Optional[Dict[str, Any]]) -> ActionExecutor:
+        if not auth_context or auth_context.get("auth_type") != "delegation":
+            return executor
+
+        base_policy = engine.get_policy()
+        scoped_policy = deep_copy_dict(base_policy)
+        agent_id = str(auth_context.get("delegatee_agent_id", "")).strip()
+        if not agent_id:
+            return executor
+
+        token_http_policy = auth_context.get("http_policy")
+        token_file_policy = auth_context.get("file_policy")
+
+        agent_cfg = scoped_policy.get("agents", {}).get(agent_id)
+        if not isinstance(agent_cfg, dict):
+            return executor
+
+        if isinstance(token_http_policy, dict):
+            agent_cfg["http_policy"] = token_http_policy
+        if isinstance(token_file_policy, dict):
+            agent_cfg["file_policy"] = token_file_policy
+
+        return ActionExecutor(scoped_policy)
+
+    def _authenticate_request(self, req: Dict[str, Any], token: str) -> Dict[str, Any]:
+        requested_agent_id = str(req.get("agent_id", "")).strip()
+        if not requested_agent_id:
+            raise ValueError("Missing agent_id")
+
+        try:
+            payload = delegation_manager.verify_token(token)
+            jti = str(payload.get("jti", "")).strip()
+            if store.is_token_revoked(jti):
+                raise PermissionError("Delegation token revoked")
+
+            stored = store.get_delegation(jti)
+            if stored is None:
+                raise PermissionError("Delegation token unknown")
+            if stored.get("_status") == "revoked":
+                raise PermissionError("Delegation token revoked")
+
+            delegatee_agent_id = str(payload.get("delegatee_agent_id", "")).strip()
+            if requested_agent_id != delegatee_agent_id:
+                raise PermissionError("Delegation token agent mismatch")
+
+            auth_context = {
+                "auth_type": "delegation",
+                "jti": jti,
+                "delegator_agent_id": str(payload.get("delegator_agent_id", "")).strip(),
+                "delegatee_agent_id": delegatee_agent_id,
+                "capabilities": list(payload.get("capabilities", [])),
+                "exp": int(payload.get("exp", 0)),
+                "http_policy": payload.get("http_policy"),
+                "file_policy": payload.get("file_policy"),
+                "metadata": payload.get("metadata", {}),
+            }
+            return auth_context
+        except DelegationError:
+            engine.verify_static_token(requested_agent_id, token)
+            return {
+                "auth_type": "static",
+                "agent_id": requested_agent_id,
+            }
+
+    def _write_event_receipt(self, receipt: Dict[str, Any]) -> Dict[str, Any]:
+        receipt["signature"] = sign_receipt(receipt)
+        append_receipt_jsonl(receipt)
+        store.insert_receipt(receipt)
+        return receipt
+
+    def _authenticate_revoker(self, token: Optional[str], revoker_agent_id: str) -> Dict[str, Any]:
+        if not revoker_agent_id:
+            raise ValueError("Missing revoker_agent_id")
+
+        if self._is_master_token(token):
+            return {
+                "auth_type": "master",
+                "agent_id": "master",
+                "is_master": True,
+            }
+
+        engine.verify_static_token(revoker_agent_id, token)
+        revoker = engine.get_agent(revoker_agent_id)
+        revoker_caps = set(revoker.get("capabilities", []))
+        if "delegate.revoke" not in revoker_caps:
+            raise PermissionError("Revoker lacks delegate.revoke capability")
+
+        return {
+            "auth_type": "static",
+            "agent_id": revoker_agent_id,
+            "is_master": False,
+        }
+
+    def _authorize_revocation(
+        self,
+        auth_context: Dict[str, Any],
+        revoker_agent_id: str,
+        delegation_payload: Dict[str, Any],
+    ) -> None:
+        if auth_context.get("is_master"):
+            return
+
+        delegator_agent_id = str(delegation_payload.get("delegator_agent_id", "")).strip()
+        if not delegator_agent_id:
+            raise PermissionError("Delegation payload missing delegator_agent_id")
+
+        if revoker_agent_id != delegator_agent_id:
+            raise PermissionError("Only the original delegator may revoke this token")
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/health":
+            self._send_json(200, {
+                "ok": True,
+                "service": APP_TITLE,
+                "version": APP_VERSION,
+                "policy_file": str(POLICY_FILE),
+                "receipt_file": str(RECEIPT_FILE),
+                "db_path": KRONYX_DB_PATH,
+                "host": HOST,
+                "port": PORT
+            })
+            return
+
+        if parsed.path == "/receipts":
             try:
-                qs = urllib.parse.urlparse(self.path).query
-                q = urllib.parse.parse_qs(qs)
-                n = int(q.get("n", ["20"])[0])
-                rows = self.server.db.fetchall(
-                    "SELECT ledger_id, ts, agent_id, action, outcome, reason, idem_key, entry_hash, prev_hash "
-                    "FROM ledger ORDER BY ledger_id DESC LIMIT ?",
-                    (n,),
+                self._require_master_token()
+                qs = parse_qs(parsed.query)
+                limit = safe_int(qs.get("limit", ["50"])[0], 50)
+                rows = store.list_receipts(limit=limit)
+                self._send_json(200, {
+                    "ok": True,
+                    "count": len(rows),
+                    "receipts": rows
+                })
+            except PermissionError as exc:
+                self._send_json(403, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"Internal error: {exc}"})
+            return
+
+        if parsed.path == "/delegations":
+            try:
+                self._require_master_token()
+                qs = parse_qs(parsed.query)
+                limit = safe_int(qs.get("limit", ["50"])[0], 50)
+                delegatee_agent_id = qs.get("delegatee_agent_id", [None])[0]
+                delegator_agent_id = qs.get("delegator_agent_id", [None])[0]
+                status = qs.get("status", [None])[0]
+
+                rows = store.list_delegations(
+                    limit=limit,
+                    delegatee_agent_id=delegatee_agent_id,
+                    delegator_agent_id=delegator_agent_id,
+                    status=status,
                 )
-                out = [dict(r) for r in rows][::-1]
-                return self._json(200, {"ok": True, "rows": out})
-            except Exception as e:
-                return self._json(500, {"ok": False, "error": str(e)})
+                self._send_json(200, {
+                    "ok": True,
+                    "count": len(rows),
+                    "delegations": rows
+                })
+            except PermissionError as exc:
+                self._send_json(403, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"Internal error: {exc}"})
+            return
 
-        self._json(404, {"ok": False, "error": "not_found"})
+        self._send_json(404, {"ok": False, "error": "Not found"})
 
-    def do_POST(self):
-        if self.path != "/execute":
-            return self._json(404, {"ok": False, "error": "not_found"})
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
 
-        try:
-            body = self._read_json()
-            agent_id = str(body.get("agent_id", ""))
-            token = str(body.get("token", ""))
-            action = str(body.get("action", ""))
-            capability = str(body.get("capability", ""))
-            idem_key = str(body.get("idem_key", "")) or ""
-            payload = body.get("payload", {}) or {}
+        if parsed.path == "/reload":
+            try:
+                self._require_master_token()
+                engine.reload()
+                self._send_json(200, {"ok": True, "message": "Policy reloaded"})
+            except PermissionError as exc:
+                self._send_json(403, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"Internal error: {exc}"})
+            return
 
-            if not (agent_id and token and action and capability):
-                raise GovernanceError("bad_request", "agent_id, token, action, capability required")
+        if parsed.path == "/delegate":
+            try:
+                req = self._read_json_body()
+                token = self._get_bearer_token()
+                if token is None:
+                    self._send_json(401, {"ok": False, "error": "Missing Bearer token"})
+                    return
 
-            resp = self.server.runtime.execute(agent_id, token, action, capability, idem_key, payload)
-            return self._json(200, {"ok": True, "result": resp})
-        except GovernanceError as ge:
-            return self._json(403, {"ok": False, "error": ge.code, "message": ge.message, "details": ge.details})
-        except Exception as e:
-            return self._json(500, {"ok": False, "error": "internal_error", "message": str(e)})
+                delegator_agent_id = str(req.get("delegator_agent_id", "")).strip()
+                delegatee_agent_id = str(req.get("delegatee_agent_id", "")).strip()
+                requested_capabilities = req.get("capabilities", [])
+                ttl_seconds = safe_int(req.get("ttl_seconds", 0), 0)
+                http_policy = req.get("http_policy")
+                file_policy = req.get("file_policy")
+                metadata = req.get("metadata", {})
+
+                if not delegator_agent_id:
+                    raise ValueError("Missing delegator_agent_id")
+                if not delegatee_agent_id:
+                    raise ValueError("Missing delegatee_agent_id")
+                if not isinstance(requested_capabilities, list) or not requested_capabilities:
+                    raise ValueError("capabilities must be a non-empty list")
+                if ttl_seconds <= 0:
+                    raise ValueError("ttl_seconds must be > 0")
+                if not isinstance(metadata, dict):
+                    metadata = {}
+
+                engine.verify_static_token(delegator_agent_id, token)
+                delegator = engine.get_agent(delegator_agent_id)
+
+                delegator_caps = set(delegator.get("capabilities", []))
+                if "delegate.issue" not in delegator_caps:
+                    raise PermissionError("Delegator lacks delegate.issue capability")
+
+                delegation_policy = delegator.get("delegation_policy", {})
+                if not isinstance(delegation_policy, dict):
+                    delegation_policy = {}
+
+                max_ttl_seconds = safe_int(delegation_policy.get("max_ttl_seconds", 3600), 3600)
+                if ttl_seconds > max_ttl_seconds:
+                    raise PermissionError(f"ttl_seconds exceeds max_ttl_seconds={max_ttl_seconds}")
+
+                allowed_delegate_capabilities = set(delegation_policy.get("allowed_delegate_capabilities", []))
+                if not allowed_delegate_capabilities:
+                    allowed_delegate_capabilities = delegator_caps.copy()
+                    allowed_delegate_capabilities.discard("delegate.issue")
+                    allowed_delegate_capabilities.discard("delegate.revoke")
+
+                requested_caps_set = set(str(x).strip() for x in requested_capabilities if str(x).strip())
+                if not requested_caps_set:
+                    raise ValueError("No valid capabilities requested")
+
+                if not requested_caps_set.issubset(allowed_delegate_capabilities):
+                    disallowed = sorted(requested_caps_set - allowed_delegate_capabilities)
+                    raise PermissionError(f"Requested capabilities not delegable: {disallowed}")
+
+                if http_policy is not None and not isinstance(http_policy, dict):
+                    raise ValueError("http_policy must be an object")
+                if file_policy is not None and not isinstance(file_policy, dict):
+                    raise ValueError("file_policy must be an object")
+
+                exp = now_ts() + ttl_seconds
+                payload = delegation_manager.build_payload(
+                    delegator_agent_id=delegator_agent_id,
+                    delegatee_agent_id=delegatee_agent_id,
+                    allowed_capabilities=sorted(requested_caps_set),
+                    expires_at_epoch=exp,
+                    http_policy=http_policy,
+                    file_policy=file_policy,
+                    metadata=metadata,
+                )
+                delegation_token = delegation_manager.mint_token(payload)
+                store.insert_delegation(payload)
+
+                receipt = {
+                    "receipt_id": f"krxdel_{uuid.uuid4().hex[:18]}",
+                    "timestamp": iso_now(),
+                    "timestamp_epoch": now_ts(),
+                    "event_type": "delegation_issued",
+                    "agent_id": delegator_agent_id,
+                    "action": "delegate.issue",
+                    "allowed": True,
+                    "reason": "Delegation issued",
+                    "estimated_cost_usd": 0.0,
+                    "delegator_agent_id": delegator_agent_id,
+                    "delegatee_agent_id": delegatee_agent_id,
+                    "delegation_jti": payload["jti"],
+                    "capabilities": sorted(requested_caps_set),
+                    "exp": exp,
+                    "ttl_seconds": ttl_seconds,
+                    "http_policy": http_policy,
+                    "file_policy": file_policy,
+                    "metadata": metadata,
+                    "auth_context": {
+                        "auth_type": "static",
+                        "agent_id": delegator_agent_id,
+                    }
+                }
+                receipt = self._write_event_receipt(receipt)
+
+                self._send_json(200, {
+                    "ok": True,
+                    "delegation_token": delegation_token,
+                    "delegation_payload": payload,
+                    "receipt_id": receipt["receipt_id"],
+                    "signature": receipt["signature"],
+                })
+                return
+
+            except PermissionError as exc:
+                self._send_json(403, {"ok": False, "error": str(exc)})
+                return
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"Internal error: {exc}"})
+                return
+
+        if parsed.path == "/revoke":
+            try:
+                req = self._read_json_body()
+                token = self._get_bearer_token()
+                if token is None:
+                    self._send_json(401, {"ok": False, "error": "Missing Bearer token"})
+                    return
+
+                revoker_agent_id = str(req.get("revoker_agent_id", "")).strip()
+                jti = str(req.get("jti", "")).strip()
+                reason = str(req.get("reason", "revoked")).strip() or "revoked"
+
+                if not jti:
+                    raise ValueError("Missing jti")
+                if not self._is_master_token(token) and not revoker_agent_id:
+                    raise ValueError("Missing revoker_agent_id")
+
+                revocation_auth = self._authenticate_revoker(token, revoker_agent_id)
+                effective_revoker_agent_id = revoker_agent_id if revoker_agent_id else "master"
+
+                delegation_payload = store.get_delegation(jti)
+                if delegation_payload is None:
+                    raise ValueError("Unknown delegation jti")
+
+                self._authorize_revocation(
+                    auth_context=revocation_auth,
+                    revoker_agent_id=effective_revoker_agent_id,
+                    delegation_payload=delegation_payload,
+                )
+
+                already_revoked = store.is_token_revoked(jti) or delegation_payload.get("_status") == "revoked"
+
+                if already_revoked:
+                    receipt = {
+                        "receipt_id": f"krxrev_{uuid.uuid4().hex[:18]}",
+                        "timestamp": iso_now(),
+                        "timestamp_epoch": now_ts(),
+                        "event_type": "delegation_revoke_noop",
+                        "agent_id": effective_revoker_agent_id,
+                        "action": "delegate.revoke",
+                        "allowed": True,
+                        "reason": "Delegation already revoked",
+                        "estimated_cost_usd": 0.0,
+                        "delegation_jti": jti,
+                        "revoked_by_agent_id": effective_revoker_agent_id,
+                        "delegation_payload": delegation_payload,
+                        "auth_context": revocation_auth
+                    }
+                    receipt = self._write_event_receipt(receipt)
+
+                    self._send_json(200, {
+                        "ok": True,
+                        "jti": jti,
+                        "status": "already_revoked",
+                        "receipt_id": receipt["receipt_id"],
+                        "signature": receipt["signature"],
+                    })
+                    return
+
+                store.revoke_token(
+                    jti=jti,
+                    revoked_by_agent_id=effective_revoker_agent_id,
+                    reason=reason,
+                    payload=delegation_payload,
+                )
+
+                receipt = {
+                    "receipt_id": f"krxrev_{uuid.uuid4().hex[:18]}",
+                    "timestamp": iso_now(),
+                    "timestamp_epoch": now_ts(),
+                    "event_type": "delegation_revoked",
+                    "agent_id": effective_revoker_agent_id,
+                    "action": "delegate.revoke",
+                    "allowed": True,
+                    "reason": reason,
+                    "estimated_cost_usd": 0.0,
+                    "delegation_jti": jti,
+                    "revoked_by_agent_id": effective_revoker_agent_id,
+                    "delegation_payload": delegation_payload,
+                    "auth_context": revocation_auth
+                }
+                receipt = self._write_event_receipt(receipt)
+
+                self._send_json(200, {
+                    "ok": True,
+                    "jti": jti,
+                    "status": "revoked",
+                    "receipt_id": receipt["receipt_id"],
+                    "signature": receipt["signature"],
+                })
+                return
+
+            except PermissionError as exc:
+                self._send_json(403, {"ok": False, "error": str(exc)})
+                return
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"Internal error: {exc}"})
+                return
+
+        if parsed.path == "/execute":
+            try:
+                req = self._read_json_body()
+                token = self._get_bearer_token()
+                if token is None:
+                    self._send_json(401, {"ok": False, "error": "Missing Bearer token"})
+                    return
+
+                auth_context = self._authenticate_request(req, token)
+
+                decision = engine.authorize(req, auth_context=auth_context)
+                if not decision.get("ok"):
+                    finalized = engine.finalize(req, decision, execution=None, auth_context=auth_context)
+                    self._send_json(403, finalized)
+                    return
+
+                scoped_executor = self._build_executor_for_auth(auth_context)
+
+                try:
+                    execution = scoped_executor.execute(req)
+                    final_decision = engine.finalize(req, decision, execution=execution, auth_context=auth_context)
+                    self._send_json(200, final_decision)
+                    return
+                except ExecutionError as exc:
+                    denied = dict(decision)
+                    denied["ok"] = False
+                    denied["reason"] = f"Execution failed: {exc}"
+                    final_decision = engine.finalize(req, denied, execution=None, auth_context=auth_context)
+                    self._send_json(400, final_decision)
+                    return
+
+            except PermissionError as exc:
+                self._send_json(403, {"ok": False, "error": str(exc)})
+                return
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"Internal error: {exc}"})
+                return
+
+        self._send_json(404, {"ok": False, "error": "Not found"})
 
 
-class KronyxHTTPServer(ThreadingHTTPServer):
-    def __init__(self, server_address, RequestHandlerClass, db: DB, runtime: KronyxRuntime):
-        super().__init__(server_address, RequestHandlerClass)
-        self.db = db
-        self.runtime = runtime
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8787)
-    ap.add_argument("--db", default=DB_FILE_DEFAULT)
-    ap.add_argument("--secret", default=HMAC_SECRET_DEFAULT)
-    args = ap.parse_args()
-
-    if args.secret == "CHANGE_ME__set_KRONYX_HMAC_SECRET":
-        print("WARNING: You should set KRONYX_HMAC_SECRET in your environment for real use.")
-
-    db = DB(args.db)
-    runtime = KronyxRuntime(db, args.secret)
-
-    httpd = KronyxHTTPServer((args.host, args.port), Handler, db, runtime)
-    print(f"[KRONYX] runtime listening on http://{args.host}:{args.port}")
-    print(f"[KRONYX] db={args.db}")
-    print(f"[KRONYX] allowlist hosts={sorted(runtime.allowed_http_hosts)}")
-    httpd.serve_forever()
+def main() -> None:
+    ensure_policy_file()
+    server = ThreadingHTTPServer((HOST, PORT), KronyxHandler)
+    print(f"{APP_TITLE} listening on http://{HOST}:{PORT}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down Kronyx Runtime Kernel...", flush=True)
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,2 @@
+Kronyx test file.
+This proves file.read is executing through the policy kernel.
