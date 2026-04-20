@@ -27,6 +27,14 @@ type keyset struct {
 
 func main() {
 	ks := newKeyset(os.Getenv("TOKEN_REVOCATION_FILE"))
+	go func() {
+		t := time.NewTicker(1 * time.Hour)
+		defer t.Stop()
+		for range t.C {
+			ks.gcRevocations(30 * 24 * time.Hour)
+			_ = ks.persistRevocations()
+		}
+	}()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("/v1/token", func(w http.ResponseWriter, r *http.Request) {
@@ -72,7 +80,20 @@ func main() {
 		_ = json.NewEncoder(w).Encode(map[string]any{"token": raw, "claims": claims})
 	})
 	mux.HandleFunc("/v1/keys", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(ks.publicJWK())
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(ks.publicJWK())
+			return
+		}
+		if r.Method == http.MethodPost {
+			kid, err := ks.rotateActiveKey()
+			if err != nil {
+				http.Error(w, "failed to rotate key", http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"active_kid": kid})
+			return
+		}
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
 
 	mux.HandleFunc("/v1/revocations", func(w http.ResponseWriter, r *http.Request) {
@@ -176,4 +197,29 @@ func (k *keyset) persistRevocations() error {
 		return err
 	}
 	return os.WriteFile(k.revocationFile, b, 0o600)
+}
+
+func (k *keyset) rotateActiveKey() (string, error) {
+	kp, err := crypto.NewKeyPair()
+	if err != nil {
+		return "", err
+	}
+	kid := "k-" + ids.New()
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.private[kid] = kp.Private
+	k.public[kid] = kp.Public
+	k.active = kid
+	return kid, nil
+}
+
+func (k *keyset) gcRevocations(ttl time.Duration) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	cutoff := time.Now().UTC().Add(-ttl)
+	for ref, ts := range k.revoked {
+		if ts.Before(cutoff) {
+			delete(k.revoked, ref)
+		}
+	}
 }

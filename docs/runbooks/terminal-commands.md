@@ -142,3 +142,16 @@ export TOKEN_CLOCK_SKEW_SECONDS=30
 # then start gateway
 go run ./services/enforcement-gateway
 ```
+
+## 13) Key rotation (token-service)
+```bash
+curl -sS -X POST http://localhost:8082/v1/keys | jq
+curl -sS http://localhost:8082/v1/keys | jq
+```
+
+## 14) Policy reload (meter)
+```bash
+# requires METER_POLICY_PATH to be set when meter starts
+curl -sS -X POST http://localhost:8081/v1/policy | jq
+curl -sS http://localhost:8081/v1/policy | jq
+```

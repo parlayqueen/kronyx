@@ -23,3 +23,18 @@ func TestRevocationPersistence(t *testing.T) {
 		t.Fatal("expected persisted revocation key")
 	}
 }
+
+func TestKeyRotation(t *testing.T) {
+	ks := newKeyset("")
+	old, _ := ks.activeKey()
+	newKid, err := ks.rotateActiveKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newKid == old {
+		t.Fatal("expected rotated key id to differ")
+	}
+	if _, ok := ks.publicJWK()["keys"]; !ok {
+		t.Fatal("expected keys in jwk output")
+	}
+}

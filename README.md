@@ -21,3 +21,8 @@ make e2e
 
 ## Runbook
 - Terminal commands: `docs/runbooks/terminal-commands.md`
+
+
+## Operational APIs
+- Meter: `GET/POST /v1/policy` for policy inspection and hot reload.
+- Token service: `POST /v1/keys` for signing key rotation.
