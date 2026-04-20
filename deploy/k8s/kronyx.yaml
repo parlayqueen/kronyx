@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meter
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: meter}}
+  template:
+    metadata: {labels: {app: meter}}
+    spec:
+      containers:
+        - name: meter
+          image: kronyx:latest
+          command: ["go","run","./services/meter"]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: meter}
+spec:
+  selector: {app: meter}
+  ports:
+    - port: 8081
+      targetPort: 8081

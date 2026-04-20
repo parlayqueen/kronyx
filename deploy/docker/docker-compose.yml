@@ -1,0 +1,18 @@
+version: '3.8'
+services:
+  meter:
+    build: ../../
+    command: ["go","run","./services/meter"]
+    ports: ["8081:8081"]
+  token-service:
+    build: ../../
+    command: ["go","run","./services/token-service"]
+    ports: ["8082:8082"]
+  enforcement-gateway:
+    build: ../../
+    command: ["go","run","./services/enforcement-gateway"]
+    ports: ["8083:8083"]
+  receipt-ledger:
+    build: ../../
+    command: ["go","run","./services/receipt-ledger"]
+    ports: ["8084:8084"]
