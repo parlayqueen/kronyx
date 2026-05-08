@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kronyx.dev/schemas/actions/action_request.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request_id","action_type","resource","env","subject","payload","bounds","phase","requested_at"],
+  "properties": {
+    "request_id": {"type":"string","minLength":8},
+    "action_type": {"type":"string","enum":["iam.rotate_prod_credentials","payments.initiate_wire","secrets.write","deploy.promote_to_prod","infra.modify_network","storage.delete_snapshot","db.run_destructive_migration","support.export_customer_data"]},
+    "resource": {"type":"string","minLength":3},
+    "env": {"type":"string","enum":["dev","stage","prod"]},
+    "subject": {
+      "type":"object","additionalProperties":false,
+      "required":["id","attrs","groups"],
+      "properties":{
+        "id":{"type":"string"},
+        "attrs":{"type":"object","additionalProperties":{"type":"string"}},
+        "groups":{"type":"array","items":{"type":"string"}}
+      }
+    },
+    "payload": {"type":"object"},
+    "bounds": {"type":"object","additionalProperties":{"type":"string"}},
+    "phase": {"type":"string"},
+    "requested_at": {"type":"string","format":"date-time"}
+  }
+}

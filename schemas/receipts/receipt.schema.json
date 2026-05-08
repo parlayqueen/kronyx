@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kronyx.dev/schemas/receipts/receipt.schema.json",
+  "type":"object",
+  "additionalProperties": false,
+  "required":["request_hash","policy_version","evaluation_result","token_id","actor","resource","connector","connector_code","summary"],
+  "properties":{
+    "request_hash":{"type":"string","pattern":"^[a-f0-9]{64}$"},
+    "policy_version":{"type":"string"},
+    "evaluation_result":{"type":"string","enum":["allow","deny"]},
+    "token_id":{"type":"string"},
+    "actor":{"type":"string"},
+    "resource":{"type":"string"},
+    "connector":{"type":"string"},
+    "connector_code":{"type":"integer"},
+    "summary":{"type":"string","minLength":1}
+  }
+}
