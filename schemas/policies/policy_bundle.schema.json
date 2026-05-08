@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kronyx.dev/schemas/policies/policy_bundle.schema.json",
+  "type":"object",
+  "additionalProperties": false,
+  "required":["version","rules"],
+  "properties":{
+    "version":{"type":"string"},
+    "rules":{
+      "type":"array",
+      "items":{
+        "type":"object",
+        "additionalProperties":false,
+        "required":["id","action_type","env","allowed_groups","resource_prefix","required_attrs","max_ttl_seconds","required_phase"],
+        "properties":{
+          "id":{"type":"string"},
+          "action_type":{"type":"string"},
+          "env":{"type":"string"},
+          "allowed_groups":{"type":"array","items":{"type":"string"}},
+          "resource_prefix":{"type":"string"},
+          "required_attrs":{"type":"object","additionalProperties":{"type":"string"}},
+          "max_ttl_seconds":{"type":"integer","minimum":1,"maximum":600},
+          "required_phase":{"type":"string"}
+        }
+      }
+    }
+  }
+}
